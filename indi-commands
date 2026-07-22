@@ -1,0 +1,9 @@
+# Remote indiserver commands on host 192.168.1.150 host
+
+indiserver -m 100 -p 7625 -u /tmp/indiserver -v indi_asi_ccd
+indiserver -m 100 -p 7626 -u /tmp/indiserver2 -v indi_qhy_ccd
+indiserver -m 100 -p 7627 -u /tmp/indiserver3  -v indi_eqmod_telescope indi_asi_wheel indi_moonlite_focus
+
+# Local indiserver commands to connect to Remote indiserver
+
+indiserver -m 100 -v "ZWO CCD ASI1600MM-Cool"@192.168.1.150:7625 "QHY CCD QHY5LII-M-6057d"@192.168.1.150:7626 "EQMod Mount"@192.168.1.150:7627 "MoonLite"@192.168.1.150:7627 "ASI EFW"@192.168.1.150:7627
