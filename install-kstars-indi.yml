@@ -1,0 +1,794 @@
+---
+# =============================================================================
+# KStars + Ekos + INDI Library installer
+#
+#   Ubuntu / Kubuntu -> binary packages from the official INDI PPAs
+#   Debian           -> build from the latest upstream release tags (default)
+#                       or use Debian's own packages (debian_install_method=distro)
+#
+# Ekos is not a separate package: it is the observatory-control module built
+# into KStars. Installing KStars gives you Ekos.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini install-kstars-indi.yml
+#   ansible-playbook -i inventory.ini install-kstars-indi.yml -e astro_user=jurgen
+# =============================================================================
+
+- name: Install KStars, Ekos and the INDI Library
+  hosts: astro
+  become: true
+  gather_facts: true
+
+  vars:
+    # ---- Account that will actually run KStars -------------------------------
+    # Must be a real login user: it gets added to the device access groups.
+    astro_user: "{{ ansible_user | default(lookup('env', 'USER')) }}"
+
+    # ---- Debian strategy -----------------------------------------------------
+    #   source  : compile latest upstream stable tags  (recommended, slow)
+    #   distro  : install whatever Debian ships        (fast, lags upstream)
+    debian_install_method: source
+
+    # ---- Optional extras -----------------------------------------------------
+    install_phd2: true            # external autoguider (Ubuntu PPA / Debian repo)
+    install_indi_webmanager: true # web UI for starting INDI servers
+    install_indi_dev: false       # headers; only needed to compile against INDI
+    install_3rdparty_drivers: true # ZWO, QHY, Player One, Pegasus, ... (big build)
+
+    # ---- Source build settings ----------------------------------------------
+    src_prefix: /usr/local
+    src_workdir: /usr/local/src/astro
+    build_jobs: "{{ ansible_processor_vcpus | default(2) }}"
+
+    # Pin a tag here to freeze a version, e.g. indi_version: v2.1.4
+    indi_version: ""
+    stellarsolver_version: ""
+    kstars_version: ""
+
+    indi_repo: https://github.com/indilib/indi.git
+    indi_3rdparty_repo: https://github.com/indilib/indi-3rdparty.git
+    stellarsolver_repo: https://github.com/rlancaste/stellarsolver.git
+    kstars_repo: https://invent.kde.org/education/kstars.git
+
+    # Extra flags passed to the KStars cmake invocation, e.g. "-DBUILD_QT5=ON"
+    kstars_cmake_extra_args: ""
+
+    # ---- Device access -------------------------------------------------------
+    astro_groups: [dialout, plugdev, video, tty]
+
+    # Raise the USB buffer so large-sensor cameras stop dropping frames.
+    # Requires a reboot to take effect (adds a kernel cmdline parameter).
+    tune_usbfs_memory: false
+    usbfs_memory_mb: 1000
+
+  # ---------------------------------------------------------------------------
+  handlers:
+    - name: Reload udev rules
+      ansible.builtin.command: udevadm control --reload-rules
+      changed_when: false
+      listen: udev changed
+
+    - name: Trigger udev
+      ansible.builtin.command: udevadm trigger --subsystem-match=usb
+      changed_when: false
+      listen: udev changed
+
+    - name: Run ldconfig
+      ansible.builtin.command: ldconfig
+      changed_when: false
+
+    - name: Update grub
+      ansible.builtin.command: update-grub
+      changed_when: true
+
+  # ---------------------------------------------------------------------------
+  pre_tasks:
+    - name: Fail early on unsupported distributions
+      ansible.builtin.assert:
+        that: ansible_os_family == 'Debian'
+        fail_msg: >-
+          This playbook targets Debian and Ubuntu/Kubuntu only
+          (detected: {{ ansible_distribution }} {{ ansible_distribution_version }}).
+
+    - name: Refuse to configure root as the astronomy user
+      ansible.builtin.assert:
+        that:
+          - astro_user | length > 0
+          - astro_user != 'root'
+        fail_msg: "Set -e astro_user=<your login name> to a non-root account."
+
+    - name: Confirm the astronomy user exists
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ astro_user }}"
+
+    - name: Refresh package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install baseline tooling
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - git
+          - gnupg
+          - python3-apt
+        state: present
+
+  # ===========================================================================
+  tasks:
+
+    # -----------------------------------------------------------------------
+    # UBUNTU / KUBUNTU — official INDI PPAs
+    # -----------------------------------------------------------------------
+    - name: Ubuntu / Kubuntu
+      when: ansible_distribution in ['Ubuntu', 'Kubuntu', 'Pop!_OS', 'Linux Mint', 'Neon']
+      tags: [ubuntu]
+      vars:
+        # Override ppa_suite if the PPA has no build for your release yet,
+        # e.g. -e ppa_suite=noble on a brand-new Ubuntu.
+        ppa_suite: "{{ ansible_distribution_release }}"
+        # There is only ONE INDI PPA. It carries both the INDI library and
+        # kstars-bleeding. (ppa:mutlaqja/kstars does not exist.)
+        # Nightly builds, if you ever want them: ppa:mutlaqja/indinightly
+        astro_ppas:
+          - { owner: mutlaqja, name: ppa, keyfile: indi }
+      block:
+
+        - name: Install keyring tooling
+          ansible.builtin.apt:
+            name:
+              - ca-certificates
+              - curl
+              - dirmngr
+              - gnupg
+            state: present
+
+        - name: Build the PPA list
+          ansible.builtin.set_fact:
+            ppa_list: >-
+              {{
+                astro_ppas
+                + ([{'owner': 'pch', 'name': 'phd2', 'keyfile': 'phd2'}]
+                   if install_phd2 | bool else [])
+              }}
+
+        - name: Ensure the keyring directory exists
+          ansible.builtin.file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: '0755'
+
+        # Ask Launchpad directly rather than letting the module guess.
+        - name: Look up PPA signing key fingerprints
+          ansible.builtin.uri:
+            url: "https://api.launchpad.net/1.0/~{{ item.owner }}/+archive/ubuntu/{{ item.name }}"
+            return_content: true
+          loop: "{{ ppa_list }}"
+          loop_control:
+            label: "{{ item.owner }}/{{ item.name }}"
+          register: ppa_meta
+
+        - name: Verify each PPA reported a fingerprint
+          ansible.builtin.assert:
+            that: item.json.signing_key_fingerprint | default('') | length >= 40
+            fail_msg: >-
+              Launchpad returned no signing key for
+              ppa:{{ item.item.owner }}/{{ item.item.name }} — check the PPA name.
+          loop: "{{ ppa_meta.results }}"
+          loop_control:
+            label: "{{ item.item.owner }}/{{ item.item.name }}"
+
+        # HTTPS on 443, so this works where hkp:// on port 80 is blocked.
+        - name: Fetch and dearmor the PPA signing keys
+          ansible.builtin.shell:
+            cmd: >-
+              set -o pipefail &&
+              curl -fsSL
+              "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x{{ item.json.signing_key_fingerprint }}"
+              | gpg --dearmor --yes -o "/etc/apt/keyrings/{{ item.item.keyfile }}.gpg"
+            creates: "/etc/apt/keyrings/{{ item.item.keyfile }}.gpg"
+            executable: /bin/bash
+          loop: "{{ ppa_meta.results }}"
+          loop_control:
+            label: "{{ item.item.keyfile }}"
+
+        - name: Confirm the keyrings are non-empty
+          ansible.builtin.command:
+            cmd: "gpg --show-keys --with-colons /etc/apt/keyrings/{{ item.item.keyfile }}.gpg"
+          loop: "{{ ppa_meta.results }}"
+          loop_control:
+            label: "{{ item.item.keyfile }}"
+          register: keyring_check
+          changed_when: false
+          failed_when: "'pub:' not in keyring_check.stdout"
+
+        # Check the suite exists BEFORE apt update, otherwise the failure
+        # surfaces as an opaque 404 from apt.
+        - name: Confirm each PPA publishes builds for this release
+          ansible.builtin.uri:
+            url: >-
+              https://ppa.launchpadcontent.net/{{ item.owner }}/{{ item.name }}/ubuntu/dists/{{ ppa_suite }}/Release
+            method: HEAD
+            status_code: [200, 404]
+          loop: "{{ ppa_list }}"
+          loop_control:
+            label: "{{ item.owner }}/{{ item.name }} ({{ ppa_suite }})"
+          register: ppa_suite_check
+          changed_when: false
+          check_mode: false
+
+        - name: Fail clearly if a PPA has no build for this release
+          ansible.builtin.fail:
+            msg: >-
+              ppa:{{ item.item.owner }}/{{ item.item.name }} publishes nothing for
+              '{{ ppa_suite }}'. The INDI maintainers usually lag a few weeks
+              behind a new Ubuntu release. Re-run with
+              -e ppa_suite=<previous LTS codename>, or build from source the way
+              the Debian path does.
+          loop: "{{ ppa_suite_check.results }}"
+          loop_control:
+            label: "{{ item.item.owner }}/{{ item.item.name }}"
+          when: item.status != 200
+
+        # Written directly rather than via deb822_repository, which needs
+        # python3-debian on the target and fails at import time without it.
+        - name: Add the PPA source entries
+          ansible.builtin.copy:
+            dest: "/etc/apt/sources.list.d/{{ item.keyfile }}.sources"
+            mode: '0644'
+            content: |
+              Types: deb
+              URIs: https://ppa.launchpadcontent.net/{{ item.owner }}/{{ item.name }}/ubuntu
+              Suites: {{ ppa_suite }}
+              Components: main
+              Signed-By: /etc/apt/keyrings/{{ item.keyfile }}.gpg
+          loop: "{{ ppa_list }}"
+          loop_control:
+            label: "{{ item.owner }}/{{ item.name }}"
+          register: ppa_sources
+
+        - name: "Remove stale ppa: list files from earlier runs"
+          ansible.builtin.file:
+            path: "/etc/apt/sources.list.d/{{ item }}"
+            state: absent
+          loop:
+            - mutlaqja-ubuntu-ppa-{{ ansible_distribution_release }}.list
+            - mutlaqja-ubuntu-kstars-{{ ansible_distribution_release }}.list
+            - pch-ubuntu-phd2-{{ ansible_distribution_release }}.list
+          register: stale_ppa
+
+        - name: Refresh cache after adding the PPAs
+          ansible.builtin.apt:
+            update_cache: true
+          when: (ppa_sources is changed) or (stale_ppa is changed)
+
+        # Package names differ across Ubuntu releases: older releases use
+        # indi-full, newer ones ship indi-3rdparty-drivers instead. Probe
+        # rather than guess, so this keeps working across upgrades.
+        # indi-full (older) and indi-3rdparty-drivers (26.04+) declare
+        # Conflicts: against each other, so exactly ONE may be selected.
+        # On 26.04 indi-full is stale and uninstallable (it still depends on
+        # indi-qsi, indi-atik, indi-toupbase, indi-svbony, which are gone),
+        # so prefer indi-3rdparty-drivers wherever it exists.
+        - name: Determine which INDI packages this release provides
+          ansible.builtin.shell: |
+            have() { apt-cache show "$1" >/dev/null 2>&1; }
+
+            # --- exactly one driver bundle, newest naming first ---
+            if have indi-3rdparty-drivers; then
+              echo indi-3rdparty-drivers
+            elif have indi-full; then
+              echo indi-full
+            fi
+
+            # --- everything else is additive and non-conflicting ---
+            for p in {{ indi_pkg_extras | join(' ') }}; do
+              have "$p" && echo "$p"
+            done
+            true
+          args:
+            executable: /bin/bash
+          vars:
+            # libindi-dev / indi-bin / libindi1 are pulled in transitively;
+            # listing them explicitly only creates more chances to conflict.
+            indi_pkg_extras: >-
+              {{
+                ['kstars-bleeding', 'gsc']
+                + (['libindi-dev'] if install_indi_dev | bool else [])
+                + (['indiwebmanager'] if install_indi_webmanager | bool else [])
+                + (['phd2'] if install_phd2 | bool else [])
+              }}
+          register: indi_pkgs
+          changed_when: false
+
+        - name: Show the package set that will be installed
+          ansible.builtin.debug:
+            var: indi_pkgs.stdout_lines
+
+        - name: Fail if the PPA provides no KStars build
+          ansible.builtin.assert:
+            that: "'kstars-bleeding' in indi_pkgs.stdout_lines"
+            fail_msg: >-
+              kstars-bleeding is not available for '{{ ppa_suite }}'. The PPA
+              usually lags a few weeks behind a new Ubuntu release. Retry with
+              -e ppa_suite=<previous LTS codename>, install the KStars Flatpak
+              (flatpak install flathub org.kde.kstars), or use the source path.
+
+        - name: Install KStars, INDI and driver set
+          ansible.builtin.apt:
+            name: "{{ indi_pkgs.stdout_lines }}"
+            state: present
+            install_recommends: true
+          notify: udev changed
+
+    - name: Debian (distribution packages)
+      when:
+        - ansible_distribution == 'Debian'
+        - debian_install_method == 'distro'
+      tags: [debian, distro]
+      block:
+
+        - name: Install KStars and INDI from the Debian archive
+          ansible.builtin.apt:
+            name: >-
+              {{
+                ['kstars', 'indi-bin', 'libindi-dev', 'gsc']
+                + (['phd2'] if install_phd2 | bool else [])
+              }}
+            state: present
+          notify: udev changed
+
+        - name: Install available third-party INDI driver packages
+          ansible.builtin.shell: |
+            set -e
+            pkgs=$(apt-cache --names-only search '^indi-' \
+                   | awk '{print $1}' \
+                   | grep -Ev '^(indi-bin|indi-dbg)' || true)
+            [ -n "$pkgs" ] && DEBIAN_FRONTEND=noninteractive apt-get -y install $pkgs
+            true
+          register: debian_drivers
+          changed_when: "'newly installed' in debian_drivers.stdout"
+          when: install_3rdparty_drivers | bool
+          notify: udev changed
+
+    # -----------------------------------------------------------------------
+    # DEBIAN — option B: build the latest upstream releases
+    # -----------------------------------------------------------------------
+    - name: Debian (build from source)
+      when:
+        - ansible_distribution == 'Debian'
+        - debian_install_method == 'source'
+      tags: [debian, source]
+      block:
+
+        # --- deb-src, so we can lean on Debian's own build dependencies -----
+        - name: Locate deb822 source files
+          ansible.builtin.find:
+            paths: /etc/apt/sources.list.d
+            patterns: '*.sources'
+          register: deb822_sources
+
+        - name: Enable deb-src in deb822 sources
+          ansible.builtin.replace:
+            path: "{{ item.path }}"
+            regexp: '^(Types:[ \t]*deb)[ \t]*$'
+            replace: '\1 deb-src'
+          loop: "{{ deb822_sources.files }}"
+          loop_control:
+            label: "{{ item.path }}"
+          register: deb822_enabled
+
+        - name: Enable deb-src in legacy sources.list
+          ansible.builtin.replace:
+            path: /etc/apt/sources.list
+            regexp: '^#[ \t]*(deb-src[ \t]+.*)$'
+            replace: '\1'
+          register: legacy_enabled
+          failed_when: false
+
+        - name: Refresh cache with source repositories
+          ansible.builtin.apt:
+            update_cache: true
+          when: (deb822_enabled is changed) or (legacy_enabled is changed)
+
+        - name: Pull Debian's build dependencies for kstars and indi
+          ansible.builtin.command:
+            cmd: "apt-get -y --no-install-recommends build-dep {{ item }}"
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+          loop: [kstars, indi]
+          register: build_dep
+          changed_when: "'newly installed' in build_dep.stdout"
+          failed_when: false
+
+        # --- explicit dependency list, filtered by what actually exists -----
+        - name: Determine which build dependencies are available
+          ansible.builtin.shell: |
+            set -o pipefail
+            for p in {{ source_build_candidates | join(' ') }}; do
+              apt-cache show "$p" >/dev/null 2>&1 && echo "$p"
+            done
+            true
+          args:
+            executable: /bin/bash
+          vars:
+            source_build_candidates:
+              # toolchain
+              - build-essential
+              - cmake
+              - extra-cmake-modules
+              - pkg-config
+              - gettext
+              - dkms
+              - fxload
+              # core libraries
+              - libcfitsio-dev
+              - libnova-dev
+              - libgsl-dev
+              - libjpeg-dev
+              - libtiff-dev
+              - libpng-dev
+              - libraw-dev
+              - libfftw3-dev
+              - libeigen3-dev
+              - wcslib-dev
+              - zlib1g-dev
+              - libcurl4-gnutls-dev
+              - libusb-1.0-0-dev
+              - libftdi1-dev
+              - libgphoto2-dev
+              - libdc1394-dev
+              - libdc1394-22-dev
+              - libgps-dev
+              - libev-dev
+              - libtheora-dev
+              - libavcodec-dev
+              - libavdevice-dev
+              - libzmq3-dev
+              - librtlsdr-dev
+              - libboost-dev
+              - libboost-regex-dev
+              - libsecret-1-dev
+              - libnut-dev
+              # Qt6 / KF6
+              - qt6-base-dev
+              - qt6-declarative-dev
+              - qt6-svg-dev
+              - qt6-websockets-dev
+              - qt6-datavis3d-dev
+              - qt6-multimedia-dev
+              - qt6-tools-dev
+              - qt6-5compat-dev
+              - qtkeychain-qt6-dev
+              - libkf6config-dev
+              - libkf6crash-dev
+              - libkf6i18n-dev
+              - libkf6kio-dev
+              - libkf6newstuff-dev
+              - libkf6notifications-dev
+              - libkf6notifyconfig-dev
+              - libkf6plotting-dev
+              - libkf6widgetsaddons-dev
+              - libkf6windowsystem-dev
+              - libkf6xmlgui-dev
+              - libkf6doctools-dev
+              - kf6-kdoctools-dev
+              # Qt5 / KF5 fallback (older Debian)
+              - qtbase5-dev
+              - qtdeclarative5-dev
+              - libqt5svg5-dev
+              - libqt5websockets5-dev
+              - libqt5datavisualization5-dev
+              - qt5keychain-dev
+              - libkf5plotting-dev
+              - libkf5xmlgui-dev
+              - libkf5newstuff-dev
+              - libkf5notifications-dev
+              - libkf5notifyconfig-dev
+              - libkf5crash-dev
+              - kdoctools-dev
+              - kio-dev
+              # runtime data
+              - breeze-icon-theme
+              - xplanet
+              - xplanet-images
+              - gsc
+              - astrometry.net
+              - astrometry-data-tycho2
+          register: available_deps
+          changed_when: false
+
+        - name: Install build dependencies
+          ansible.builtin.apt:
+            name: "{{ available_deps.stdout_lines }}"
+            state: present
+
+        - name: Create the build workspace
+          ansible.builtin.file:
+            path: "{{ src_workdir }}"
+            state: directory
+            mode: '0755'
+
+        # --- resolve the newest release tag of each project ------------------
+        - name: Resolve latest upstream release tags
+          ansible.builtin.shell: |
+            set -o pipefail
+            git ls-remote --tags --refs "{{ item.repo }}" \
+              | awk -F/ '{print $NF}' \
+              | grep -E '^(v|stable-)?[0-9]+(\.[0-9]+){1,3}$' \
+              | sort -V \
+              | tail -n1
+          args:
+            executable: /bin/bash
+          loop:
+            - { name: indi, repo: "{{ indi_repo }}", pin: "{{ indi_version }}" }
+            - { name: stellarsolver, repo: "{{ stellarsolver_repo }}", pin: "{{ stellarsolver_version }}" }
+            - { name: kstars, repo: "{{ kstars_repo }}", pin: "{{ kstars_version }}" }
+          loop_control:
+            label: "{{ item.name }}"
+          when: item.pin | length == 0
+          register: latest_tags
+          changed_when: false
+
+        - name: Build a name -> tag map
+          ansible.builtin.set_fact:
+            astro_tags: >-
+              {{
+                dict(
+                  latest_tags.results
+                  | rejectattr('skipped', 'defined')
+                  | map(attribute='item.name') | list
+                  |
+                  zip(
+                    latest_tags.results
+                    | rejectattr('skipped', 'defined')
+                    | map(attribute='stdout') | list
+                  )
+                )
+                | combine({
+                    'indi': indi_version,
+                    'stellarsolver': stellarsolver_version,
+                    'kstars': kstars_version
+                  } | dict2items | rejectattr('value', 'equalto', '') | items2dict)
+              }}
+
+        - name: Show the versions that will be built
+          ansible.builtin.debug:
+            msg: >-
+              indi={{ astro_tags.indi }}
+              stellarsolver={{ astro_tags.stellarsolver }}
+              kstars={{ astro_tags.kstars }}
+
+        - name: Assert every tag resolved
+          ansible.builtin.assert:
+            that: astro_tags[item] | default('') | length > 0
+            fail_msg: "Could not resolve a release tag for {{ item }}; pin it with -e {{ item }}_version=<tag>."
+          loop: [indi, stellarsolver, kstars]
+
+        # --- INDI core -------------------------------------------------------
+        - name: Clone INDI core
+          ansible.builtin.git:
+            repo: "{{ indi_repo }}"
+            dest: "{{ src_workdir }}/indi"
+            version: "{{ astro_tags.indi }}"
+            depth: 1
+            force: true
+          register: indi_src
+
+        - name: Configure INDI core
+          ansible.builtin.command:
+            cmd: >-
+              cmake -S {{ src_workdir }}/indi -B {{ src_workdir }}/build-indi
+              -DCMAKE_INSTALL_PREFIX={{ src_prefix }}
+              -DCMAKE_BUILD_TYPE=Release
+            creates: "{{ src_workdir }}/build-indi/CMakeCache.txt"
+
+        - name: Build and install INDI core
+          ansible.builtin.command:
+            cmd: "cmake --build {{ src_workdir }}/build-indi --target install -j {{ build_jobs }}"
+          changed_when: true
+          notify:
+            - Run ldconfig
+            - udev changed
+
+        - name: Register {{ src_prefix }}/lib with the dynamic linker
+          ansible.builtin.copy:
+            dest: /etc/ld.so.conf.d/astro-local.conf
+            content: "{{ src_prefix }}/lib\n"
+            mode: '0644'
+          notify: Run ldconfig
+
+        - name: Flush linker configuration before building dependents
+          ansible.builtin.meta: flush_handlers
+
+        # --- INDI third-party (vendor SDKs + drivers) ------------------------
+        - name: Third-party INDI drivers
+          when: install_3rdparty_drivers | bool
+          block:
+
+            - name: Clone indi-3rdparty
+              ansible.builtin.git:
+                repo: "{{ indi_3rdparty_repo }}"
+                dest: "{{ src_workdir }}/indi-3rdparty"
+                version: "{{ astro_tags.indi }}"
+                depth: 1
+                force: true
+              # the 3rdparty repo tracks the same release tags as INDI core
+              failed_when: false
+              register: thirdparty_clone
+
+            - name: Fall back to the master branch of indi-3rdparty
+              ansible.builtin.git:
+                repo: "{{ indi_3rdparty_repo }}"
+                dest: "{{ src_workdir }}/indi-3rdparty"
+                version: master
+                depth: 1
+                force: true
+              when: thirdparty_clone is failed or thirdparty_clone is skipped
+
+            # Vendor SDK libraries must be installed before the drivers build.
+            - name: Configure third-party libraries
+              ansible.builtin.command:
+                cmd: >-
+                  cmake -S {{ src_workdir }}/indi-3rdparty
+                  -B {{ src_workdir }}/build-3rdparty-libs
+                  -DCMAKE_INSTALL_PREFIX={{ src_prefix }}
+                  -DCMAKE_BUILD_TYPE=Release
+                  -DBUILD_LIBS=1
+                creates: "{{ src_workdir }}/build-3rdparty-libs/CMakeCache.txt"
+
+            - name: Build and install third-party libraries
+              ansible.builtin.command:
+                cmd: "cmake --build {{ src_workdir }}/build-3rdparty-libs --target install -j {{ build_jobs }}"
+              changed_when: true
+              notify:
+                - Run ldconfig
+                - udev changed
+
+            - name: Flush linker configuration before building drivers
+              ansible.builtin.meta: flush_handlers
+
+            - name: Configure third-party drivers
+              ansible.builtin.command:
+                cmd: >-
+                  cmake -S {{ src_workdir }}/indi-3rdparty
+                  -B {{ src_workdir }}/build-3rdparty
+                  -DCMAKE_INSTALL_PREFIX={{ src_prefix }}
+                  -DCMAKE_BUILD_TYPE=Release
+                creates: "{{ src_workdir }}/build-3rdparty/CMakeCache.txt"
+
+            - name: Build and install third-party drivers
+              ansible.builtin.command:
+                cmd: "cmake --build {{ src_workdir }}/build-3rdparty --target install -j {{ build_jobs }}"
+              changed_when: true
+              notify:
+                - Run ldconfig
+                - udev changed
+
+        # --- StellarSolver (KStars' internal plate solver) -------------------
+        - name: Clone StellarSolver
+          ansible.builtin.git:
+            repo: "{{ stellarsolver_repo }}"
+            dest: "{{ src_workdir }}/stellarsolver"
+            version: "{{ astro_tags.stellarsolver }}"
+            depth: 1
+            force: true
+
+        - name: Configure StellarSolver
+          ansible.builtin.command:
+            cmd: >-
+              cmake -S {{ src_workdir }}/stellarsolver -B {{ src_workdir }}/build-stellarsolver
+              -DCMAKE_INSTALL_PREFIX={{ src_prefix }}
+              -DCMAKE_BUILD_TYPE=Release
+            creates: "{{ src_workdir }}/build-stellarsolver/CMakeCache.txt"
+
+        - name: Build and install StellarSolver
+          ansible.builtin.command:
+            cmd: "cmake --build {{ src_workdir }}/build-stellarsolver --target install -j {{ build_jobs }}"
+          changed_when: true
+          notify: Run ldconfig
+
+        - name: Flush linker configuration before building KStars
+          ansible.builtin.meta: flush_handlers
+
+        # --- KStars (which contains Ekos) ------------------------------------
+        - name: Clone KStars
+          ansible.builtin.git:
+            repo: "{{ kstars_repo }}"
+            dest: "{{ src_workdir }}/kstars"
+            version: "{{ astro_tags.kstars }}"
+            depth: 1
+            force: true
+
+        - name: Configure KStars
+          ansible.builtin.command:
+            cmd: >-
+              cmake -S {{ src_workdir }}/kstars -B {{ src_workdir }}/build-kstars
+              -DCMAKE_INSTALL_PREFIX={{ src_prefix }}
+              -DCMAKE_BUILD_TYPE=Release
+              {{ kstars_cmake_extra_args }}
+            creates: "{{ src_workdir }}/build-kstars/CMakeCache.txt"
+
+        - name: Build and install KStars
+          ansible.builtin.command:
+            cmd: "cmake --build {{ src_workdir }}/build-kstars --target install -j {{ build_jobs }}"
+          changed_when: true
+          notify: Run ldconfig
+
+        # --- udev rules land outside the search path when prefix=/usr/local --
+        - name: Find udev rules installed under the local prefix
+          ansible.builtin.find:
+            paths:
+              - "{{ src_prefix }}/lib/udev/rules.d"
+              - "{{ src_prefix }}/share/udev/rules.d"
+            patterns: '*.rules'
+          register: local_udev_rules
+          failed_when: false
+
+        - name: Link udev rules into /etc/udev/rules.d
+          ansible.builtin.file:
+            src: "{{ item.path }}"
+            dest: "/etc/udev/rules.d/{{ item.path | basename }}"
+            state: link
+            force: true
+          loop: "{{ local_udev_rules.files | default([]) }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+          notify: udev changed
+
+        - name: Install PHD2 if Debian packages it
+          ansible.builtin.apt:
+            name: phd2
+            state: present
+          failed_when: false
+          when: install_phd2 | bool
+
+  # ===========================================================================
+  post_tasks:
+
+    - name: Grant the astronomy user access to serial and USB devices
+      ansible.builtin.user:
+        name: "{{ astro_user }}"
+        groups: "{{ astro_groups | join(',') }}"
+        append: true
+
+    - name: Raise the USB filesystem memory limit
+      when: tune_usbfs_memory | bool
+      block:
+        - name: Add usbfs_memory_mb to the kernel command line
+          ansible.builtin.lineinfile:
+            path: /etc/default/grub
+            regexp: '^GRUB_CMDLINE_LINUX_DEFAULT='
+            line: 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash usbcore.usbfs_memory_mb={{ usbfs_memory_mb }}"'
+          notify: Update grub
+
+        - name: Apply the limit for the current boot
+          ansible.builtin.copy:
+            dest: /sys/module/usbcore/parameters/usbfs_memory_mb
+            content: "{{ usbfs_memory_mb }}"
+            unsafe_writes: true
+          changed_when: false
+          failed_when: false
+
+    - name: Collect installed versions
+      ansible.builtin.shell: |
+        set +e
+        echo "kstars:      $(kstars --version 2>/dev/null | head -n1 || echo 'not found')"
+        echo "indiserver:  $(indiserver --help 2>&1 | grep -i -m1 version || echo 'not found')"
+        echo "drivers:     $(ls {{ src_prefix }}/bin/indi_* /usr/bin/indi_* 2>/dev/null | wc -l)"
+        exit 0
+      register: astro_versions
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ astro_versions.stdout_lines }}"
+
+    - name: Remind about group membership
+      ansible.builtin.debug:
+        msg: >-
+          {{ astro_user }} was added to {{ astro_groups | join(', ') }}.
+          Log out and back in (or reboot) before connecting mounts and cameras.
