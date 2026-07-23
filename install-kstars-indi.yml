@@ -30,9 +30,37 @@
     debian_install_method: source
 
     # ---- Optional extras -----------------------------------------------------
+    install_kstars: true          # false = headless INDI server, no GUI
     install_phd2: true            # external autoguider (Ubuntu PPA / Debian repo)
     install_indi_webmanager: true # web UI for starting INDI servers
     install_indi_dev: false       # headers; only needed to compile against INDI
+
+    # ---- Astrometry.net ------------------------------------------------------
+    # Ekos plate-solves with StellarSolver (built into KStars) by default, but
+    # both StellarSolver and astrometry.net read the SAME index files, so you
+    # need the indexes regardless. The solver binaries are the optional part.
+    install_astrometry: true
+
+    # Index series to install. Each index covers a range of field-of-view.
+    # 4208-4219 covers roughly 2-30 arcmin: right for most telescope+CCD
+    # combinations. Add 4204-4207 for wide-field / short focal length rigs.
+    # The full 2mass set is tens of GB; do not install it blindly.
+    astrometry_index_packages:
+      - astrometry-data-tycho2
+      - astrometry-data-tycho2-10-19
+      - astrometry-data-2mass-08
+      - astrometry-data-2mass-09
+      - astrometry-data-2mass-10
+      - astrometry-data-2mass-11
+
+    astrometry_packages: "{{ ['astrometry.net'] + astrometry_index_packages }}"
+
+    # ---- PHD2 ----------------------------------------------------------------
+    # true  = compile from source when no package is available
+    # false = skip PHD2 entirely if unpackaged (Ekos has an internal guider)
+    phd2_build_from_source: true
+    phd2_repo: https://github.com/OpenPHDGuiding/phd2.git
+    phd2_version: ""              # blank = newest release tag
     install_3rdparty_drivers: true # ZWO, QHY, Player One, Pegasus, ... (big build)
 
     # ---- Source build settings ----------------------------------------------
@@ -129,13 +157,36 @@
       vars:
         # Override ppa_suite if the PPA has no build for your release yet,
         # e.g. -e ppa_suite=noble on a brand-new Ubuntu.
-        ppa_suite: "{{ ansible_distribution_release }}"
+        # Ubuntu and every flavour (Kubuntu, Xubuntu, Lubuntu, MATE, Budgie)
+        # all report ansible_distribution == 'Ubuntu' with a valid Ubuntu
+        # codename, so they need no special handling.
+        #
+        # Derivatives are the exception: Linux Mint's release codename is its
+        # own ('xia', 'wilma', ...), not an Ubuntu suite, so building a PPA URL
+        # from it yields a 404. Those systems carry UBUNTU_CODENAME in
+        # /etc/os-release; ubuntu_codename below prefers it when present.
+        ppa_suite: "{{ ubuntu_codename | default(ansible_distribution_release, true) }}"
         # There is only ONE INDI PPA. It carries both the INDI library and
         # kstars-bleeding. (ppa:mutlaqja/kstars does not exist.)
         # Nightly builds, if you ever want them: ppa:mutlaqja/indinightly
         astro_ppas:
           - { owner: mutlaqja, name: ppa, keyfile: indi }
       block:
+
+        - name: Read UBUNTU_CODENAME from /etc/os-release
+          ansible.builtin.shell: |
+            . /etc/os-release
+            printf '%s' "${UBUNTU_CODENAME:-}"
+          args:
+            executable: /bin/bash
+          register: os_codename
+          changed_when: false
+          check_mode: false
+
+        - name: Resolve the PPA suite
+          ansible.builtin.set_fact:
+            ubuntu_codename: "{{ os_codename.stdout | trim }}"
+          when: os_codename.stdout | trim | length > 0
 
         - name: Install keyring tooling
           ansible.builtin.apt:
@@ -296,7 +347,10 @@
             # listing them explicitly only creates more chances to conflict.
             indi_pkg_extras: >-
               {{
-                ['kstars-bleeding', 'gsc']
+                (['kstars-bleeding', 'breeze-icon-theme'] if install_kstars | bool else [])
+                + ['gsc']
+                + ['fxload']
+                + (astrometry_packages if install_astrometry | bool else [])
                 + (['libindi-dev'] if install_indi_dev | bool else [])
                 + (['indiwebmanager'] if install_indi_webmanager | bool else [])
                 + (['phd2'] if install_phd2 | bool else [])
@@ -316,6 +370,7 @@
               usually lags a few weeks behind a new Ubuntu release. Retry with
               -e ppa_suite=<previous LTS codename>, install the KStars Flatpak
               (flatpak install flathub org.kde.kstars), or use the source path.
+          when: install_kstars | bool
 
         - name: Install KStars, INDI and driver set
           ansible.builtin.apt:
@@ -748,6 +803,202 @@
 
   # ===========================================================================
   post_tasks:
+
+    # -----------------------------------------------------------------------
+    # QHY: firmware loader + the doubled path in the shipped udev rules
+    # -----------------------------------------------------------------------
+    - name: QHY firmware loading
+      tags: [qhy]
+      block:
+
+        - name: Ensure fxload is installed
+          ansible.builtin.apt:
+            name: fxload
+            state: present
+          register: fxload_pkg
+          failed_when: false
+
+        - name: Warn if fxload is unavailable
+          ansible.builtin.debug:
+            msg: >-
+              fxload could not be installed. QHY cameras that need firmware
+              uploaded at plug time (QHY5 and other FX2-based models) will not
+              enumerate. On Ubuntu, fxload lives in universe -
+              enable it with: add-apt-repository universe
+          when: fxload_pkg is failed
+
+        - name: Locate the QHY udev rules shipped by the package
+          ansible.builtin.stat:
+            path: /lib/udev/rules.d/85-qhyccd.rules
+          register: qhy_rules
+
+        - name: Check whether the rules contain the doubled firmware path
+          ansible.builtin.command:
+            cmd: grep -c "/lib/firmware/qhy/qhy/" /lib/udev/rules.d/85-qhyccd.rules
+          register: qhy_doubled
+          changed_when: false
+          failed_when: false
+          when: qhy_rules.stat.exists
+
+        # Rather than editing /lib (which apt overwrites on every upgrade of
+        # indi-qhy), drop a corrected copy in /etc/udev/rules.d. udev reads
+        # /etc first and a same-named file there fully shadows the one in /lib,
+        # so the fix survives package upgrades.
+        - name: Install a corrected copy of the QHY rules in /etc
+          ansible.builtin.shell: |
+            set -euo pipefail
+            # Anchor on the trailing slash. Without it, '/lib/firmware/qhy/qhy'
+            # also matches the start of filenames like qhy5loader.hex and would
+            # mangle them into '5loader.hex'.
+            sed 's#/lib/firmware/qhy/qhy/#/lib/firmware/qhy/#g' \
+                /lib/udev/rules.d/85-qhyccd.rules \
+                > /etc/udev/rules.d/85-qhyccd.rules.new
+            if ! cmp -s /etc/udev/rules.d/85-qhyccd.rules.new \
+                        /etc/udev/rules.d/85-qhyccd.rules 2>/dev/null; then
+              mv /etc/udev/rules.d/85-qhyccd.rules.new \
+                 /etc/udev/rules.d/85-qhyccd.rules
+              echo CHANGED
+            else
+              rm -f /etc/udev/rules.d/85-qhyccd.rules.new
+            fi
+          args:
+            executable: /bin/bash
+          register: qhy_fix
+          changed_when: "'CHANGED' in qhy_fix.stdout"
+          when:
+            - qhy_rules.stat.exists
+            - (qhy_doubled.stdout | default('0') | int) > 0
+          notify: udev changed
+
+        - name: Verify the firmware files are where the corrected rules expect
+          ansible.builtin.find:
+            paths: /lib/firmware/qhy
+            patterns: ['*.HEX', '*.hex', '*.img', '*.bin']
+            recurse: false
+          register: qhy_firmware
+          when: qhy_rules.stat.exists
+
+        - name: Report the QHY firmware situation
+          ansible.builtin.debug:
+            msg: >-
+              {{ (qhy_firmware.files | default([]) | length) }} firmware files in
+              /lib/firmware/qhy.
+              {{ 'Corrected rules written to /etc/udev/rules.d/85-qhyccd.rules.'
+                 if qhy_fix is changed
+                 else 'Shipped rules already correct, or no fix needed.' }}
+          when: qhy_rules.stat.exists
+
+    # -----------------------------------------------------------------------
+    # PHD2 from source, when no package exists for this release
+    # -----------------------------------------------------------------------
+    - name: PHD2
+      when: install_phd2 | bool
+      tags: [phd2]
+      block:
+
+        - name: Check whether PHD2 is already installed or packaged
+          ansible.builtin.shell: |
+            command -v phd2 >/dev/null 2>&1 && { echo installed; exit 0; }
+            apt-cache show phd2 >/dev/null 2>&1 && { echo packaged; exit 0; }
+            echo missing
+          args:
+            executable: /bin/bash
+          register: phd2_state
+          changed_when: false
+
+        - name: Install the PHD2 package
+          ansible.builtin.apt:
+            name: phd2
+            state: present
+          when: phd2_state.stdout == 'packaged'
+          register: phd2_apt
+          failed_when: false
+
+        - name: Build PHD2 from source
+          when:
+            - phd2_build_from_source | bool
+            - >-
+              phd2_state.stdout == 'missing'
+              or (phd2_apt is defined and phd2_apt is failed)
+          block:
+
+            - name: Probe for PHD2 build dependencies
+              ansible.builtin.shell: |
+                for p in {{ phd2_dep_candidates | join(' ') }}; do
+                  apt-cache show "$p" >/dev/null 2>&1 && echo "$p"
+                done
+                true
+              args:
+                executable: /bin/bash
+              vars:
+                # wxWidgets is the moving target here: 3.0 / 3.2 / 3.4 and the
+                # t64 ABI rename all coexist across releases, so probe rather
+                # than pin. Same for the OpenCV and gtest naming.
+                phd2_dep_candidates:
+                  - build-essential
+                  - cmake
+                  - pkg-config
+                  - git
+                  - gettext
+                  - libwxgtk3.2-dev
+                  - libwxgtk3.0-gtk3-dev
+                  - wx-common
+                  - wx3.2-headers
+                  - wx3.0-headers
+                  - libindi-dev
+                  - libnova-dev
+                  - libcurl4-gnutls-dev
+                  - libeigen3-dev
+                  - libopencv-dev
+                  - libgtest-dev
+                  - libudev-dev
+                  - libusb-1.0-0-dev
+                  - zlib1g-dev
+                  - libx11-dev
+              register: phd2_deps
+              changed_when: false
+
+            - name: Install PHD2 build dependencies
+              ansible.builtin.apt:
+                name: "{{ phd2_deps.stdout_lines }}"
+                state: present
+
+            - name: Resolve the newest PHD2 release tag
+              ansible.builtin.shell: |
+                set -o pipefail
+                git ls-remote --tags --refs "{{ phd2_repo }}" \
+                  | awk -F/ '{print $NF}' \
+                  | grep -E '^v?[0-9]+(\.[0-9]+){1,3}$' \
+                  | sort -V | tail -n1
+              args:
+                executable: /bin/bash
+              register: phd2_tag
+              changed_when: false
+              when: phd2_version | length == 0
+
+            - name: Clone PHD2
+              ansible.builtin.git:
+                repo: "{{ phd2_repo }}"
+                dest: "{{ src_workdir }}/phd2"
+                version: >-
+                  {{ phd2_version if phd2_version | length > 0
+                     else phd2_tag.stdout | trim }}
+                depth: 1
+                force: true
+
+            - name: Configure PHD2
+              ansible.builtin.command:
+                cmd: >-
+                  cmake -S {{ src_workdir }}/phd2 -B {{ src_workdir }}/build-phd2
+                  -DCMAKE_INSTALL_PREFIX={{ src_prefix }}
+                  -DCMAKE_BUILD_TYPE=Release
+                creates: "{{ src_workdir }}/build-phd2/CMakeCache.txt"
+
+            - name: Build and install PHD2
+              ansible.builtin.command:
+                cmd: "cmake --build {{ src_workdir }}/build-phd2 --target install -j {{ build_jobs }}"
+              changed_when: true
+              notify: Run ldconfig
 
     - name: Grant the astronomy user access to serial and USB devices
       ansible.builtin.user:
